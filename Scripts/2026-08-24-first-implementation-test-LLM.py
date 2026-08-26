@@ -34,6 +34,9 @@ class LLM:
                                 quantization_config=quantization_config,
                                 device_map="auto",
                             )
+
+        print(type(self.model))
+        print(type(self.tokenizer))
         
         self.preprompt = model_preprompt
         self.opening_message = model_opening_message
