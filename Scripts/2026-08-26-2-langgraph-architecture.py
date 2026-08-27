@@ -3,6 +3,7 @@ import sys
 import json
 from typing import TypedDict
 from pydantic import BaseModel, Field
+from langgraph.graph import StateGraph, START, END
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -35,6 +36,12 @@ from transformers import (
 # - Message about how the system works
 # - Keep conversation history
 
+# TO DO 28th of August 2026
+# - Function to handle REAL END
+# - change name to process_history
+# - remove history for all LLMs except the conversation LLM
+# - update the state keeping only the input parameters, but setting the process history back to null
+
 # POSSIBLE PROBLEMS:
 # - number of new max tokens too small and limits the generated output of the LLM
 
@@ -60,8 +67,85 @@ class InputParameters(BaseModel):
 
 schema = InputParameters.model_json_schema()
 
-PROMPT_LLM_CHAT = "You're a helpful and kind assistant who tries to answer correctly to the questions of the user. " \
-                "If you're not sure, don't give an answer and say that you don't know the answer."
+PROMPT_LLM_CHAT = """
+                    You are the conversational assistant of a combustion mechanism selection system.
+
+                    Your role is to communicate naturally with the user while helping them define the
+                    input parameters required for a combustion mechanism selection/reduction task.
+
+                    You are given:
+                    1. The user's latest message.
+                    2. A summary of what the system has done so far.
+                    3. The current input parameters.
+
+                    Your job is ONLY to produce the response that should be shown to the user.
+
+                    GENERAL RULES:
+
+                    - Be helpful, clear, concise, and natural.
+                    - Answer the user's latest message directly.
+                    - Do not invent facts, parameters, values, mechanisms, or experimental conditions.
+                    - Do not change, extract, verify, or infer input parameters yourself.
+                    - Treat the CURRENT INPUT PARAMETERS as the parameters currently established by the system.
+                    - Treat the PROCESS HISTORY as a description of actions already performed by the system.
+                    - Do not mention internal agents, LLMs, LangGraph, nodes, routing, prompts, JSON,
+                    or other implementation details unless the user explicitly asks about how the
+                    system works.
+                    - Do not explain what another agent has done internally. Instead, communicate
+                    the result naturally to the user.
+
+                    WHEN PARAMETERS HAVE JUST BEEN RETRIEVED OR UPDATED:
+
+                    - Clearly present the currently established parameters to the user when appropriate.
+                    - If the system has filled or suggested values that were not explicitly provided
+                    by the user, make it clear that these are suggested/default values rather than
+                    values provided by the user.
+                    - Ask the user whether the proposed configuration is correct when confirmation
+                    is required.
+                    - Do not silently present inferred or default values as if the user had provided them.
+
+                    WHEN INFORMATION IS MISSING:
+
+                    - Ask the user for the missing information that is necessary to continue.
+                    - Prefer asking only the most relevant question(s), rather than listing many
+                    questions at once.
+                    - If several missing parameters are equally important, ask them in a logical order.
+                    - Never invent an answer merely to avoid asking the user.
+
+                    WHEN THE USER CORRECTS A PARAMETER:
+
+                    - Acknowledge the correction naturally.
+                    - Present the updated configuration if appropriate.
+                    - If further confirmation is required, ask the user to confirm it.
+
+                    WHEN THE USER ASKS A GENERAL COMBUSTION QUESTION:
+
+                    - Answer the question normally if you can do so reliably.
+                    - Do not modify the input parameters unless the user's message explicitly
+                    requests a parameter change.
+                    - If you are uncertain about a technical fact, say that you are uncertain rather
+                    than inventing an answer.
+
+                    CONFIRMATION:
+
+                    When all required parameters are available and the system indicates that the
+                    configuration should be confirmed, explicitly ask the user whether the complete
+                    configuration is correct.
+
+                    Do not assume that the user is satisfied merely because all parameters are filled.
+
+                    STYLE:
+
+                    - Professional but conversational.
+                    - Concise.
+                    - Avoid unnecessary technical jargon.
+                    - Do not repeat information unnecessarily.
+                    - Ask direct questions.
+                    - Do not expose internal reasoning.
+
+                    The response you generate will be shown directly to the user.
+                    Therefore, output ONLY the natural-language response to the user.
+                    """
 
 PROMPT_LLM_RETRIEVE =   f"""
                         You are an information extraction agent.
@@ -324,6 +408,112 @@ PROMPT_LLM_UPDATE = f"""
 
                     Return ONLY the complete updated JSON object.
                     """
+PROMPT_LLM_FILL = f"""
+                    You are the parameter completion agent of a combustion simulation assistant.
+
+                    Your task is to complete a partially filled set of combustion simulation parameters.
+
+                    You are given:
+                    1. CURRENT PARAMETERS: a JSON object containing the parameters currently known.
+                    2. Some parameters may have the value null because they are not yet known.
+
+                    Your task is to provide a complete and plausible configuration by filling the missing parameters.
+
+                    IMPORTANT:
+                    This is a temporary default-completion agent. In the future, missing information
+                    will be obtained from a database/RAG system. For now, use your general knowledge
+                    of combustion simulations to provide reasonable default values.
+
+                    RULES:
+
+                    1. NEVER modify a parameter that already has a non-null value.
+                    Preserve its value exactly.
+
+                    2. Only fill parameters whose value is null.
+
+                    3. For a missing parameter, choose a reasonable and commonly used value
+                    for a combustion simulation.
+
+                    4. Do not invent unusual, highly specific, or arbitrary values when a
+                    conventional default is available.
+
+                    5. For parameters involving a value and a unit:
+                    - Fill the numerical value and its corresponding unit consistently.
+                    - Do not convert or modify values that are already present.
+                    - If both the value and unit are null, provide a reasonable value and unit.
+
+                    6. If a reasonable value cannot be determined from the available information,
+                    keep the parameter as null rather than making an arbitrary guess.
+
+                    7. Do not add fields that are not part of the schema.
+
+                    8. The output must contain ALL fields from the schema.
+
+                    9. Return ONLY a valid JSON object.
+                        Do not return Markdown.
+                        Do not return ```json.
+                        Do not provide explanations or comments.
+
+                    The JSON object must follow this schema:
+
+                    {json.dumps(schema, indent=2)}
+
+                    IMPORTANT:
+                    - Do NOT put the fields inside a "properties" object.
+                    - "properties" in the description above only describes the available fields.
+                    - Your final response must have the fields directly at the top level.
+
+                    For example, the correct format is:
+
+                    {{
+                        "mechanism": null,
+                        "fuel": null,
+                        "pressure": null,
+                        "pressure_unit": null,
+                        "temperature": null,
+                        "temperature_unit": null,
+                        "equivalence_ratio": null,
+                        "target_species": null
+                    }}
+
+                    Return the complete JSON object with the missing parameters filled where
+                    a reasonable default can be provided.
+                    """
+PROMPT_LLM_ROUTER = """You are the routing agent of a combustion simulation assistant.
+
+                    Your task is to determine what the assistant should do next based on:
+
+                    1. The latest message from the user.
+                    2. The parameters currently stored.
+
+                    Available actions:
+
+                    - RETRIEVE:
+                    In case the input parameters are still empty, extract combustion parameters from the user's message and fill in the missign fields.
+
+                    - UPDATE:
+                    Modify parameters that have already been extracted in case the user indicates that he wants to modify one or multiple parameters.
+
+                    - CHAT:
+                    Respond conversationally to the user's message without modifying the simulation parameters in case the user wrote a message which is not related to the retrieval or update of certain input parameters.
+
+                    - END:
+                    In case all the input parameters are filled in and the user indicates that he is satisfied with the parameters, the conversation should end.
+
+                    IMPORTANT:
+
+                    - UPDATE is only available when existing input parameters are present.
+                    - If no input parameters exist, never select UPDATE.
+                    - If the user provides combustion parameters and no parameters currently
+                    exist, select RETRIEVE.
+                    - If parameters already exist and the user wants to change one or more
+                    of them, select UPDATE.
+                    - If the user asks a general question unrelated to modifying parameters,
+                    select CHAT.
+                    - If the user indicates that he is satisfied with all the parameters,
+                    select END.
+
+                    Return only the routing decision."""
 
 # Fourth model for suggestions?
 
@@ -364,6 +554,9 @@ class AgentState(TypedDict):
     # Latest message from the user
     user_message: str
 
+    # History of all the process
+    history: list[str] | None
+
     # Current extracted parameters
     # None means that no parameters have been established yet
     input_parameters: InputParameters | None
@@ -374,6 +567,161 @@ class AgentState(TypedDict):
     # Final response to show to the user
     response: str | None
 
+class AgentGraph:
+
+    def __init__(self, agent):
+
+        self.agent = agent
+
+        self.graph = StateGraph(AgentState)
+
+        self.graph.add_node("router", self.router_node)
+        self.graph.add_node("chat", self.chat_node)
+        self.graph.add_node("retrieve", self.retrieve_node)
+        #self.graph.add_node("verify", self.verify_node)
+        self.graph.add_node("update", self.update_node)
+        self.graph.add_node("fill", self.fill_node)
+
+        self.graph.add_edge(START, "router")
+        self.graph.add_conditional_edges(
+                                    "router",
+                                    self.route_after_router,
+                                    {
+                                        "CHAT": "chat",
+                                        "RETRIEVE": "retrieve",
+                                        "UPDATE": "update",
+                                        "END": END,
+                                    }
+                                )
+        self.graph.add_edge("chat", END)
+        self.graph.add_edge("fill", "chat")
+        self.graph.add_edge("update", "chat")
+        self.graph.add_conditional_edges(
+                                    "retrieve",
+                                    self.route_after_retrieve,
+                                    {
+                                        "chat": "chat",
+                                        "fill": "fill",
+                                    }
+                                )
+
+        self.app = self.graph.compile()
+
+    def router_node(self, state: AgentState):
+
+        possible_actions = ["CHAT"]
+
+        if all(value is not None for value in state["input_parameters"].model_dump().values()):
+            possible_actions.append("END")
+            possible_actions.append("UPDATE")
+        elif all(value is None for value in state["input_parameters"].model_dump().values()):
+            possible_actions.append("RETRIEVE")
+        else:
+            possible_actions.append("UPDATE") #should theoretically not exist since all the fields should be filled in after the retrieve
+
+        selected_route = self.agent.LLM_router.define_route(state["user_message"], state["input_parameters"], possible_actions)
+
+        return {"route": selected_route}
+
+    def chat_node(self, state: AgentState):
+
+        message = f"""
+                    CURRENT USER MESSAGE:
+                    {state["user_message"]}
+
+                    PROCESS HISTORY:
+                    {state["history"]}
+
+                    CURRENT INPUT PARAMETERS:
+                    {state["input_parameters"]}
+
+                    TASK:
+                    Respond naturally and coherently to the user's latest message.
+                    Take into account the process history, which summarizes what the agent has done since the last user's message, and the current input
+                    parameters.
+
+                    If further information is required, ask the user for it.
+                    Do not invent information.
+                    """
+
+        response = self.agent.LLM_conversation.generate(message)
+
+        return {
+            "response": response
+        }
+
+    def retrieve_node(self, state: AgentState):
+
+        LLM_retrieval_reply, input_parameters = self.agent.LLM_retrieval.retrieve_information(state["user_message"])
+
+        print(f"\nAgent: {LLM_retrieval_reply}")
+        print(f"Input parameters: {input_parameters}")
+
+        LLM_verification_reply = self.agent.LLM_verification.verify_information(state["user_message"], input_parameters)
+
+        print(f"\nVerification by the agent: {LLM_verification_reply}")
+
+        LLM_update_reply, input_parameters_updated = self.agent.LLM_update.update_information(LLM_verification_reply, input_parameters)
+        
+        print(f"\nUpdate by the agent: {LLM_update_reply}")
+
+        if all(value is not None for value in input_parameters_updated.model_dump().values()):
+            history_entry = (
+                            "RETRIEVAL RESULT: All required input parameters are currently filled. "
+                            "The agent should present the extracted parameters to the user and "
+                            "ask for confirmation."
+                        )
+        elif all(value is None for value in input_parameters_updated.model_dump().values()):
+            history_entry = (
+                            "RETRIEVAL RESULT: None of the input parameters have been retrieved from the user's message, all parameters will be inferred by the fill in function."
+                        )
+        else:
+            history_entry = (
+                            "RETRIEVAL RESULT: Some input parameters have been retrieved from the user's message, the other ones will be retrieved by the fill in function."
+                        )
+
+        return {"input_parameters": input_parameters_updated,
+                "history": state["history"] + [history_entry]}
+
+    # def verify_node(self, state: AgentState):
+    #     result = self.agent.verify(...)
+    #     return {...}
+
+    def update_node(self, state: AgentState):
+
+        LLM_reply, input_parameters_filled = self.agent.LLM_update.update_information(state["user_message"], state["input_parameters"])
+        
+        print(f"\nAgent: {LLM_reply}")
+
+        history_entry = (
+                        "UPDATE RESULT: The input parameters have been updated according to the user's request. The agent should present the extracted parameters to the user and ask for confirmation."
+                    )
+
+        return {"input_parameters": input_parameters_filled,
+                "history": state["history"] + [history_entry]}
+
+    def fill_node(self, state: AgentState):
+
+        LLM_fill_reply, input_parameters_filled = self.agent.LLM_fill.fill_missing_information(state["input_parameters"])
+        
+        print(f"\nAgent: {LLM_fill_reply}")
+
+        history_entry = (
+                        "FILL RESULT: The input parameters, that were missing from the user's message, have been filled based on the context provided by the user and combined with RAG retrieval on a combustion database. The agent should present the extracted parameters to the user and ask for confirmation."
+                    )
+
+        return {"input_parameters": input_parameters_filled,
+                "history": state["history"] + [history_entry]}
+    
+    def route_after_router(self, state: AgentState):
+        return state["route"]
+
+    def route_after_retrieve(self, state: AgentState):
+        if all(value is not None for value in state["input_parameters"].model_dump().values()):
+            return "chat" #maybe don't use the chat in that case but directly print it? How to format the string in the history for the LLM
+        
+        return "fill"
+    
 class LLM:
 
     def __init__(self, model_manager: ModelManager, model_preprompt: str) -> None:
@@ -473,14 +821,61 @@ class LLM_update(LLM):
 
         updated_json = self.generate(message, max_new_tokens=max_new_tokens, do_sample=False)
 
-        print(updated_json)
-
         data = json.loads(updated_json)
 
         updated_input_parameters = InputParameters.model_validate(data)
 
         return updated_json, updated_input_parameters
 
+class LLM_fill(LLM):
+
+    def fill_missing_information(self, current_input_parameters: str, max_new_tokens: int = 500) -> tuple[str, InputParameters]:
+
+        current_input_parameters_json = current_input_parameters.model_dump_json(indent=2)
+
+        message = f"""CURRENT PARAMETERS:
+                    {current_input_parameters_json}
+
+                    Complete the missing parameters according to your instructions.
+                    """
+
+        filled_json = self.generate(message, max_new_tokens=max_new_tokens, do_sample=False)
+
+        print(filled_json)
+
+        data = json.loads(filled_json)
+
+        filled_input_parameters = InputParameters.model_validate(data)
+
+        return filled_json, filled_input_parameters
+
+class LLM_router(LLM):
+
+    def define_route(self, user_message: str, current_input_parameters: str, list_of_possible_routes: list[str], max_new_tokens: int = 500):
+
+        current_input_parameters_json = current_input_parameters.model_dump_json(indent=2)
+
+        message = f"""USER MESSAGE:
+                    {user_message}
+
+                    CURRENT PARAMETERS:
+                    {current_input_parameters_json}
+
+                    Choose from the list below and output the most appropriate route based on the user message and the current set of parameters.
+
+                    POSSIBLE ROUTES:
+                    {list_of_possible_routes}
+
+                    Only choose from this list. You cannot choose another option.
+                    """
+
+        chosen_route = self.generate(message, max_new_tokens=max_new_tokens, do_sample=False)
+
+        if chosen_route not in list_of_possible_routes:
+            raise ValueError(f"LLM selected invalid route '{chosen_route}'. Expected one of: {list_of_possible_routes}.")
+
+        return chosen_route
+    
 class Agent:
 
     def __init__(self, model_name: str, model_preprompts: list[str], model_opening_message: str) -> None:
@@ -491,238 +886,41 @@ class Agent:
         self.LLM_retrieval = LLM_retrieval(self.model_manager, model_preprompts[1])
         self.LLM_verification = LLM_verify(self.model_manager, model_preprompts[2])
         self.LLM_update = LLM_update(self.model_manager, model_preprompts[3])
+        self.LLM_fill = LLM_fill(self.model_manager, model_preprompts[4])
+        self.LLM_router = LLM_router(self.model_manager, model_preprompts[5])
+
+        self.graph = AgentGraph(self)
 
     def chat(self) -> None:
 
-        print(f"\nAgent: {opening_message}")
+        state = {
+                "user_message": "",
+                "history": [],
+                "input_parameters": InputParameters(),
+                "route": None,
+                "response": None,
+            }
 
-        iteration = 0
+        print(f"\nAgent: {opening_message}")
 
         while True:
             try:
                 user_input = input("\nYou: ")
                 if user_input.lower() in ["exit", "quit"]: sys.exit()
 
-                if iteration == 0:
-                    LLM_retrieval_reply, input_parameters = self.LLM_retrieval.retrieve_information(user_input)
-                    #LLM_reply = self.LLM_retrieval.generate(user_input, max_new_tokens=300, do_sample=False)
+                # Update only the part of the state that changes
+                state["user_message"] = user_input
 
-                    print(f"\nAgent: {LLM_retrieval_reply}")
-                    print(f"Input parameters: {input_parameters}")
+                # Run the LangGraph
+                state = self.graph.app.invoke(state)
 
-                    LLM_verification_reply = self.LLM_verification.verify_information(user_input, input_parameters)
-
-                    print(LLM_verification_reply)
-
-                    LLM_reply, input_parameters_updated = self.LLM_update.update_information(LLM_verification_reply, input_parameters)
-                    
-                    print(f"\nAgent: {LLM_reply}")
-
-                else:
-                    #LLM_reply = self.LLM_conversation.generate(user_input)
-                    LLM_reply, input_parameters_updated = self.LLM_update.update_information(user_input, input_parameters_updated)
-
-                    print(f"\nAgent: {LLM_reply}")
-
-                iteration += 1
+                # Display the response generated by the chat node
+                print(f"\nAgent: {state['response']}")
 
             except KeyboardInterrupt:
                 sys.exit()
 
 
-chatting_agent = Agent(model_id, [PROMPT_LLM_CHAT, PROMPT_LLM_RETRIEVE, PROMPT_LLM_VERIFY, PROMPT_LLM_UPDATE], opening_message)
+
+chatting_agent = Agent(model_id, [PROMPT_LLM_CHAT, PROMPT_LLM_RETRIEVE, PROMPT_LLM_VERIFY, PROMPT_LLM_UPDATE, PROMPT_LLM_FILL, PROMPT_LLM_ROUTER], opening_message)
 chatting_agent.chat()
-
-
-"""
-
-#handle history of messages
-#handle memory
-
-
-if input_parameters is None:
-    available_routes = ["retrieve", "chat"]
-else:
-    available_routes = ["retrieve", "update", "chat"]
-
-
-PROMPT_LLM_ROUTER = 
-You are the routing agent of a combustion simulation assistant.
-
-Your task is to determine what the assistant should do next based on:
-
-1. The latest message from the user.
-2. The parameters currently stored.
-
-Available actions:
-
-- retrieve:
-  Extract combustion parameters from the user's message.
-
-- update:
-  Modify parameters that have already been extracted.
-
-- chat:
-  Respond conversationally to the user's message without modifying
-  the simulation parameters.
-
-IMPORTANT:
-
-- UPDATE is only available when existing input parameters are present.
-- If no input parameters exist, never select UPDATE.
-- If the user provides combustion parameters and no parameters currently
-  exist, select RETRIEVE.
-- If parameters already exist and the user wants to change one or more
-  of them, select UPDATE.
-- If the user asks a general question unrelated to modifying parameters,
-  select CHAT.
-
-Return only the routing decision.
-
-
-Define different nodes
-
-from langgraph.graph import StateGraph, START, END
-
-def route_from_router(state: AgentState):
-
-    return state["route"]
-
-def build_graph():
-
-    graph = StateGraph(AgentState)
-
-    # Add nodes
-    graph.add_node("router", router_node)
-    graph.add_node("retrieve", retrieval_node)
-    graph.add_node("update", update_node)
-    graph.add_node("chat", chat_node)
-
-    # Start → router
-    graph.add_edge(START, "router")
-
-    # Router → appropriate node
-    graph.add_conditional_edges(
-        "router",
-        route_from_router,
-        {
-            "retrieve": "retrieve",
-            "update": "update",
-            "chat": "chat"
-        }
-    )
-
-    # Each operation currently ends the graph
-    graph.add_edge("retrieve", END)
-    graph.add_edge("update", END)
-    graph.add_edge("chat", END)
-
-    return graph.compile()
-
-inside agent 
-    self.graph = build_graph()
-
-    def build_graph(agent):
-
-    graph = StateGraph(AgentState)
-
-    def router_node(state):
-
-        route = agent.LLM_router.route(
-            state["user_message"],
-            state["input_parameters"]
-        )
-
-        return {"route": route}
-
-    def retrieval_node(state):
-
-        reply, parameters = agent.LLM_retrieval.retrieve_information(
-            state["user_message"]
-        )
-
-        return {
-            "input_parameters": parameters.model_dump(),
-            "response": reply
-        }
-
-    def update_node(state):
-
-        updated_json, parameters = agent.LLM_update.update_InputParameters(
-            state["user_message"],
-            json.dumps(
-                state["input_parameters"],
-                indent=2
-            )
-        )
-
-        return {
-            "input_parameters": parameters.model_dump(),
-            "response": updated_json
-        }
-
-def chat_node(state):
-
-    response = agent.LLM_conversation.generate(
-        state["user_message"]
-    )
-
-    return {
-        "response": response
-    }
-
-def route_from_router(state):
-
-    return state["route"]
-
-graph.add_node("router", router_node)
-graph.add_node("retrieve", retrieval_node)
-graph.add_node("update", update_node)
-graph.add_node("chat", chat_node)
-
-graph.add_edge(START, "router")
-
-graph.add_conditional_edges(
-    "router",
-    route_from_router,
-    {
-        "retrieve": "retrieve",
-        "update": "update",
-        "chat": "chat"
-    }
-)
-
-graph.add_edge("retrieve", END)
-graph.add_edge("update", END)
-graph.add_edge("chat", END)
-
-return graph.compile()
-
-graph.add_edge("retrieve", "verify")
-graph.add_edge("update", "verify")
-
-graph.add_conditional_edges(
-    "verify",
-    verification_decision,
-    {
-        "correct": END,
-        "incorrect": "update"
-    }
-)
-
-Agent flow:
-while True:
-
-    user_message = input("You: ")
-
-    state = {
-        "user_message": user_message,
-        "input_parameters": current_parameters
-    }
-
-    result = self.graph.invoke(state)
-
-    current_parameters = result["input_parameters"]
-
-    print(result["response"])
-"""
