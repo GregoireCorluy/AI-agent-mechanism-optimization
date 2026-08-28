@@ -35,12 +35,23 @@ from transformers import (
 # - Explain to the user what is happening behind the scenes
 # - Message about how the system works
 # - Keep conversation history
+# - ask at the end if the configuration is correct
+# - have a longer discussion with multiple turns to understand what the user wants and then do the retrieval
+# - to speed up the loop, no update if already indicated that there is no modification necessary
+# - router, let it think first to make its decision?
 
 # TO DO 28th of August 2026
-# - Function to handle REAL END
-# - change name to process_history
-# - remove history for all LLMs except the conversation LLM
-# - update the state keeping only the input parameters, but setting the process history back to null
+# X Function to handle REAL END
+# X change name to process_history
+# X remove history for all LLMs except the conversation LLM
+# X update the state keeping only the input parameters, but setting the process history back to null
+# X let's make a scan with ChatGPT if he finds main errors
+# - reorganize code in different scripts when langgraph works
+# - check to do's above
+
+# TO DO later
+# - Explain the choise of the different parameters
+# - Update parameters after verification retrieval only if something to be modified
 
 # POSSIBLE PROBLEMS:
 # - number of new max tokens too small and limits the generated output of the LLM
@@ -479,41 +490,239 @@ PROMPT_LLM_FILL = f"""
                     Return the complete JSON object with the missing parameters filled where
                     a reasonable default can be provided.
                     """
-PROMPT_LLM_ROUTER = """You are the routing agent of a combustion simulation assistant.
+PROMPT_LLM_ROUTER = """
+                    You are the routing agent of a combustion simulation assistant.
 
-                    Your task is to determine what the assistant should do next based on:
-
+                    Your task is to determine what the assistant should do NEXT based on:
                     1. The latest message from the user.
                     2. The parameters currently stored.
 
-                    Available actions:
+                    Your goal is to distinguish between:
+                    - messages that provide or modify the user's simulation configuration,
+                    - questions/conversations about the simulation or combustion in general,
+                    - and messages unrelated to the task.
+
+                    AVAILABLE ACTIONS:
 
                     - RETRIEVE:
-                    In case the input parameters are still empty, extract combustion parameters from the user's message and fill in the missign fields.
+                    Use this when the user is PROVIDING INFORMATION ABOUT THE
+                    SIMULATION THEY WANT TO DEFINE.
+
+                    This includes messages that describe:
+                    - what they want to simulate,
+                    - the physical problem they want to investigate,
+                    - the application,
+                    - the fuel or operating conditions,
+                    - the combustion regime,
+                    - the chemical mechanism they want to use,
+                    - any input parameter,
+                    - or any other information that could help determine the
+                        simulation configuration.
+
+                    RETRIEVE must be selected even when the information is:
+                    - vague,
+                    - incomplete,
+                    - ambiguous,
+                    - only partially specified,
+                    - or insufficient to determine all parameters.
+
+                    Examples:
+                    - "I want to simulate hydrogen combustion."
+                    - "I'm interested in NOx emissions from a lean flame."
+                    - "I want to model a premixed flame at high pressure."
+                    - "I'm looking at autoignition of hydrogen."
+                    - "I want to simulate a turbulent combustion case."
+                    - "The inlet temperature is 900 K."
+                    - "I want to use the GRI mechanism."
+
+                    The important distinction is:
+
+                    If the user is describing THEIR SIMULATION or providing information
+                    that could be used to configure THEIR SIMULATION, select RETRIEVE.
+
+                    Do NOT select CHAT merely because the description is vague or because
+                    some parameters are missing.
+
 
                     - UPDATE:
-                    Modify parameters that have already been extracted in case the user indicates that he wants to modify one or multiple parameters.
+                    Use this when the user explicitly wants to CHANGE, CORRECT, REPLACE,
+                    REMOVE, or otherwise MODIFY a parameter that has already been established.
+
+                    UPDATE implies that the user is referring to an EXISTING parameter
+                    or configuration.
+
+                    Examples:
+                    - "Actually, change the pressure to 10 bar."
+                    - "The temperature should be 1000 K, not 900 K."
+                    - "Use methane instead of hydrogen."
+                    - "Remove the turbulence model."
+                    - "I want to change the mechanism."
+                    - "Forget the inlet temperature I gave you earlier."
+
+                    Select UPDATE only when the user intends to modify an existing
+                    configuration.
+
+                    If the user is simply providing new information without indicating
+                    that an existing value should be changed, select RETRIEVE.
+
 
                     - CHAT:
-                    Respond conversationally to the user's message without modifying the simulation parameters in case the user wrote a message which is not related to the retrieval or update of certain input parameters.
+                    Use this when the user is NOT trying to provide or modify their
+                    simulation configuration.
+
+                    CHAT includes three important categories:
+
+                    1. GENERAL COMBUSTION QUESTIONS
+                        The user asks for conceptual or educational information about
+                        combustion, without describing a simulation they want to configure.
+
+                        Examples:
+                        - "What is thermodiffusive instability?"
+                        - "Why does hydrogen have a low Lewis number?"
+                        - "What causes NOx formation?"
+                        - "What is the difference between premixed and diffusion flames?"
+                        - "How does autoignition work?"
+
+                    2. QUESTIONS ABOUT PARAMETERS
+                        The user asks WHY a parameter is needed, WHAT a parameter means,
+                        or HOW a parameter affects the simulation, without providing a
+                        new value for their own configuration.
+
+                        Examples:
+                        - "Why do you need the pressure?"
+                        - "What does the equivalence ratio mean?"
+                        - "Why was this mechanism selected?"
+                        - "Why do I need the inlet temperature?"
+                        - "What happens if I increase the pressure?"
+
+                    3. QUESTIONS ABOUT THE ASSISTANT ITSELF
+                        The user asks about the agent, its behavior, its workflow, or
+                        how it makes decisions.
+
+                        Examples:
+                        - "How does this agent work?"
+                        - "Why did you select these parameters?"
+                        - "How do you determine the mechanism?"
+                        - "What are you doing with my input?"
+                        - "How does the retrieval process work?"
+                        - "Why did you ask me for this information?"
+
+                    Also use CHAT for:
+                    - greetings,
+                    - casual conversation,
+                    - completely unrelated questions,
+                    - general questions that do not provide or modify simulation
+                        configuration.
+
+
+                    IMPORTANT DISTINCTION:
+
+                    Compare these two cases:
+
+                    "I want to simulate hydrogen combustion at 900 K."
+                        -> RETRIEVE
+                        The user is describing their simulation.
+
+                    "Why is 900 K important for the simulation?"
+                        -> CHAT
+                        The user is asking a conceptual question about a parameter.
+
+                    Similarly:
+
+                    "I want to investigate NOx formation."
+                        -> RETRIEVE
+
+                    "Why does NOx formation depend on temperature?"
+                        -> CHAT
+
+                    And:
+
+                    "I want to use the GRI mechanism."
+                        -> RETRIEVE
+
+                    "Why did you choose the GRI mechanism?"
+                        -> CHAT
+
 
                     - END:
-                    In case all the input parameters are filled in and the user indicates that he is satisfied with the parameters, the conversation should end.
+                    Use this ONLY when:
+                    1. all required input parameters are available, AND
+                    2. the user explicitly indicates that they are satisfied with the
+                        configuration, confirms it, or wants to finish.
 
-                    IMPORTANT:
+                    Examples:
+                    - "That looks correct."
+                    - "Yes, that's everything."
+                    - "The configuration is correct."
+                    - "Let's proceed."
+                    - "I'm satisfied with these parameters."
 
-                    - UPDATE is only available when existing input parameters are present.
-                    - If no input parameters exist, never select UPDATE.
-                    - If the user provides combustion parameters and no parameters currently
-                    exist, select RETRIEVE.
-                    - If parameters already exist and the user wants to change one or more
-                    of them, select UPDATE.
-                    - If the user asks a general question unrelated to modifying parameters,
-                    select CHAT.
-                    - If the user indicates that he is satisfied with all the parameters,
-                    select END.
+                    Do NOT select END merely because all parameters happen to be filled.
+                    The user must also indicate that they are satisfied or want to finish.
 
-                    Return only the routing decision."""
+
+                    DECISION RULES:
+
+                    1. First determine the user's INTENT.
+
+                    2. Ask yourself:
+
+                    "Is the user giving me information about the simulation THEY WANT
+                        TO CONFIGURE?"
+
+                    If YES -> RETRIEVE.
+
+                    3. If the user is explicitly modifying an EXISTING parameter:
+                    -> UPDATE.
+
+                    4. If the user is asking a conceptual, explanatory, or meta question
+                    about combustion, parameters, mechanisms, or the assistant:
+                    -> CHAT.
+
+                    5. If the user is asking a question AND simultaneously provides new
+                    information about their own simulation, prioritize the configuration
+                    information and select RETRIEVE.
+
+                    Example:
+                    "I want to simulate hydrogen combustion. Why do I need to specify
+                        the pressure?"
+                    -> RETRIEVE
+
+                    The user has provided simulation information that should be extracted.
+
+                    6. If the user asks why/how something was selected or determined, and
+                    they are NOT providing a new configuration value:
+                    -> CHAT.
+
+                    7. Missing parameters are NEVER a reason to select CHAT.
+
+                    8. A vague description of a simulation is still RETRIEVE.
+
+                    9. A question about a parameter is CHAT if the user is asking about
+                    its meaning, purpose, or effect.
+
+                    10. A parameter value provided by the user is RETRIEVE if it is new
+                        information, or UPDATE if the user explicitly changes an existing
+                        value.
+
+                    11. When uncertain between CHAT and RETRIEVE:
+                        - If the message contains information that could be extracted into
+                        the simulation configuration, choose RETRIEVE.
+                        - If it only asks for an explanation and provides no configuration
+                        information, choose CHAT.
+
+                    12. When uncertain between RETRIEVE and UPDATE:
+                        choose UPDATE only when there is clear evidence that an existing
+                        parameter is being changed.
+
+                    13. When uncertain between CHAT and UPDATE:
+                        choose UPDATE only if the user clearly refers to an existing
+                        parameter or configuration.
+
+                    Return ONLY the routing decision.
+                    The routing decision must consist of the key of the selected action
+                    and nothing else.
+                    """
 
 # Fourth model for suggestions?
 
@@ -555,7 +764,7 @@ class AgentState(TypedDict):
     user_message: str
 
     # History of all the process
-    history: list[str] | None
+    process_history: list[str] | None
 
     # Current extracted parameters
     # None means that no parameters have been established yet
@@ -609,9 +818,11 @@ class AgentGraph:
 
     def router_node(self, state: AgentState):
 
-        possible_actions = ["CHAT"]
+        #possible_actions = ["CHAT"]
+        possible_actions = []
 
         if all(value is not None for value in state["input_parameters"].model_dump().values()):
+            possible_actions = ["CHAT"]
             possible_actions.append("END")
             possible_actions.append("UPDATE")
         elif all(value is None for value in state["input_parameters"].model_dump().values()):
@@ -620,6 +831,8 @@ class AgentGraph:
             possible_actions.append("UPDATE") #should theoretically not exist since all the fields should be filled in after the retrieve
 
         selected_route = self.agent.LLM_router.define_route(state["user_message"], state["input_parameters"], possible_actions)
+
+        print(f"Selected route: {selected_route}")
 
         return {"route": selected_route}
 
@@ -630,7 +843,7 @@ class AgentGraph:
                     {state["user_message"]}
 
                     PROCESS HISTORY:
-                    {state["history"]}
+                    {state["process_history"]}
 
                     CURRENT INPUT PARAMETERS:
                     {state["input_parameters"]}
@@ -681,7 +894,7 @@ class AgentGraph:
                         )
 
         return {"input_parameters": input_parameters_updated,
-                "history": state["history"] + [history_entry]}
+                "process_history": state["process_history"] + [history_entry]}
 
     # def verify_node(self, state: AgentState):
     #     result = self.agent.verify(...)
@@ -698,7 +911,7 @@ class AgentGraph:
                     )
 
         return {"input_parameters": input_parameters_filled,
-                "history": state["history"] + [history_entry]}
+                "process_history": state["process_history"] + [history_entry]}
 
     def fill_node(self, state: AgentState):
 
@@ -711,7 +924,7 @@ class AgentGraph:
                     )
 
         return {"input_parameters": input_parameters_filled,
-                "history": state["history"] + [history_entry]}
+                "process_history": state["process_history"] + [history_entry]}
     
     def route_after_router(self, state: AgentState):
         return state["route"]
@@ -730,7 +943,40 @@ class LLM:
         self.preprompt = model_preprompt
         # set temperature
 
-        self.history = [{"role": "system", "content": model_preprompt}]
+    def generate(self, message: str, max_new_tokens: int = 200, do_sample: bool = True) -> str:
+
+        messages = [
+            {"role": "system", "content": self.preprompt},
+            {"role": "user", "content": message},
+        ]
+
+        inputs = self.model_manager.tokenizer.apply_chat_template(
+                                                messages,
+                                                add_generation_prompt=True,
+                                                return_tensors="pt",
+                                            ).to(self.model_manager.model.device)
+
+        outputs = self.model_manager.model.generate( #add temperature?
+                                                **inputs,
+                                                max_new_tokens=max_new_tokens,
+                                                do_sample=do_sample,
+                                            )
+
+        LLM_reply = self.model_manager.tokenizer.decode(
+                                            outputs[0][inputs["input_ids"].shape[-1]:],
+                                            skip_special_tokens=True,
+                                        )
+
+        return LLM_reply
+
+class LLM_conversation(LLM):
+
+    def __init__(self, model_manager: ModelManager, model_preprompt: str, model_opening_message: str) -> None:
+
+        super().__init__(model_manager, model_preprompt)
+
+        self.history = [{"role": "system", "content": model_preprompt},
+                        {"role": "assistant", "content": model_opening_message},]
 
     def generate(self, message: str, max_new_tokens: int = 200, do_sample: bool = True) -> str:
 
@@ -742,30 +988,20 @@ class LLM:
                                 return_tensors="pt",
                             ).to(self.model_manager.model.device)
 
-        outputs = self.model_manager.model.generate(  #set the temperature
+        outputs = self.model_manager.model.generate(
                                 **inputs,
                                 max_new_tokens=max_new_tokens,
-                                do_sample = do_sample
+                                do_sample=do_sample,
                             )
 
         LLM_reply = self.model_manager.tokenizer.decode(
                                 outputs[0][inputs["input_ids"].shape[-1]:],
                                 skip_special_tokens=True,
                             )
-        
+
         self.history.append({"role": "assistant", "content": LLM_reply})
 
         return LLM_reply
-
-class LLM_conversation(LLM):
-
-    def __init__(self, model_manager: ModelManager, model_preprompt: str, model_opening_message: str) -> None:
-
-        super().__init__(model_manager, model_preprompt)
-
-        self.history.append({"role": "assistant", "content": model_opening_message})
-
-        #ask at the end if the configuration is correct?
 
 class LLM_retrieval(LLM):
 
@@ -805,7 +1041,7 @@ class LLM_verify(LLM):
 
 class LLM_update(LLM):
 
-    def update_information(self, message_update: str, current_input_parameters: str, max_new_tokens: int = 500) -> tuple[str, InputParameters]:
+    def update_information(self, message_update: str, current_input_parameters: InputParameters, max_new_tokens: int = 500) -> tuple[str, InputParameters]:
 
         current_input_parameters_json = current_input_parameters.model_dump_json(indent=2)
 
@@ -829,7 +1065,7 @@ class LLM_update(LLM):
 
 class LLM_fill(LLM):
 
-    def fill_missing_information(self, current_input_parameters: str, max_new_tokens: int = 500) -> tuple[str, InputParameters]:
+    def fill_missing_information(self, current_input_parameters: InputParameters, max_new_tokens: int = 500) -> tuple[str, InputParameters]:
 
         current_input_parameters_json = current_input_parameters.model_dump_json(indent=2)
 
@@ -851,7 +1087,7 @@ class LLM_fill(LLM):
 
 class LLM_router(LLM):
 
-    def define_route(self, user_message: str, current_input_parameters: str, list_of_possible_routes: list[str], max_new_tokens: int = 500):
+    def define_route(self, user_message: str, current_input_parameters: InputParameters, list_of_possible_routes: list[str], max_new_tokens: int = 500):
 
         current_input_parameters_json = current_input_parameters.model_dump_json(indent=2)
 
@@ -895,7 +1131,7 @@ class Agent:
 
         state = {
                 "user_message": "",
-                "history": [],
+                "process_history": [],
                 "input_parameters": InputParameters(),
                 "route": None,
                 "response": None,
@@ -908,11 +1144,20 @@ class Agent:
                 user_input = input("\nYou: ")
                 if user_input.lower() in ["exit", "quit"]: sys.exit()
 
+                # Reset fields for new cycle
+                state["process_history"] = []
+                state["route"] = None
+                state["response"] = None
+
                 # Update only the part of the state that changes
                 state["user_message"] = user_input
 
                 # Run the LangGraph
                 state = self.graph.app.invoke(state)
+
+                if state["route"] == "END":
+                    print("\nAgent found the good input parameters.\nConversation ends here.\n")
+                    sys.exit()
 
                 # Display the response generated by the chat node
                 print(f"\nAgent: {state['response']}")
