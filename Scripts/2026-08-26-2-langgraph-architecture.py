@@ -39,6 +39,7 @@ from transformers import (
 # - have a longer discussion with multiple turns to understand what the user wants and then do the retrieval
 # - to speed up the loop, no update if already indicated that there is no modification necessary
 # - router, let it think first to make its decision?
+# - to consider: if the message of the user is both about the simulation parameters and a question, should be handled afterwards by the chat model?
 
 # TO DO 28th of August 2026
 # X Function to handle REAL END
@@ -391,7 +392,7 @@ PROMPT_LLM_UPDATE = f"""
                     CURRENT PARAMETERS:
                     {{
                         "mechanism": null,
-                        "fuel": "hydrogen",
+                        "fuel": "ammonia and hydrogen",
                         "pressure": 10,
                         "pressure_unit": "bar",
                         "temperature": 1000,
@@ -406,7 +407,7 @@ PROMPT_LLM_UPDATE = f"""
                     CORRECT OUTPUT:
                     {{
                         "mechanism": null,
-                        "fuel": "hydrogen",
+                        "fuel": "ammonia and hydrogen",
                         "pressure": 2000,
                         "pressure_unit": "mbar",
                         "temperature": 1000,
@@ -494,13 +495,15 @@ PROMPT_LLM_ROUTER = """
                     You are the routing agent of a combustion simulation assistant.
 
                     Your task is to determine what the assistant should do NEXT based on:
-                    1. The latest message from the user.
-                    2. The parameters currently stored.
+                    1. The latest message from the agent.
+                    2. The latest message from the user.
+                    3. The parameters currently stored.
 
                     Your goal is to distinguish between:
                     - messages that provide or modify the user's simulation configuration,
                     - questions/conversations about the simulation or combustion in general,
-                    - and messages unrelated to the task.
+                    - messages unrelated to the task,
+                    - messages confirming that the selected parameters are good.
 
                     AVAILABLE ACTIONS:
 
@@ -719,6 +722,9 @@ PROMPT_LLM_ROUTER = """
                         choose UPDATE only if the user clearly refers to an existing
                         parameter or configuration.
 
+                    14. When the agent asks if the configuration is good and the user confirms with e.g. 'yes',
+                        then select END.
+
                     Return ONLY the routing decision.
                     The routing decision must consist of the key of the selected action
                     and nothing else.
@@ -818,11 +824,9 @@ class AgentGraph:
 
     def router_node(self, state: AgentState):
 
-        #possible_actions = ["CHAT"]
-        possible_actions = []
+        possible_actions = ["CHAT"]
 
         if all(value is not None for value in state["input_parameters"].model_dump().values()):
-            possible_actions = ["CHAT"]
             possible_actions.append("END")
             possible_actions.append("UPDATE")
         elif all(value is None for value in state["input_parameters"].model_dump().values()):
@@ -830,7 +834,7 @@ class AgentGraph:
         else:
             possible_actions.append("UPDATE") #should theoretically not exist since all the fields should be filled in after the retrieve
 
-        selected_route = self.agent.LLM_router.define_route(state["user_message"], state["input_parameters"], possible_actions)
+        selected_route = self.agent.LLM_router.define_route(state["response"], state["user_message"], state["input_parameters"], possible_actions)
 
         print(f"Selected route: {selected_route}")
 
@@ -1087,17 +1091,20 @@ class LLM_fill(LLM):
 
 class LLM_router(LLM):
 
-    def define_route(self, user_message: str, current_input_parameters: InputParameters, list_of_possible_routes: list[str], max_new_tokens: int = 500):
+    def define_route(self, agent_message: str, user_message: str, current_input_parameters: InputParameters, list_of_possible_routes: list[str], max_new_tokens: int = 500):
 
         current_input_parameters_json = current_input_parameters.model_dump_json(indent=2)
 
-        message = f"""USER MESSAGE:
+        message = f"""LAST AGENT MESSAGE:
+                    {agent_message}
+        
+                    USER MESSAGE:
                     {user_message}
 
                     CURRENT PARAMETERS:
                     {current_input_parameters_json}
 
-                    Choose from the list below and output the most appropriate route based on the user message and the current set of parameters.
+                    Choose from the list below and output the most appropriate route based on the last agent message, the user message and the current set of parameters.
 
                     POSSIBLE ROUTES:
                     {list_of_possible_routes}
@@ -1147,7 +1154,6 @@ class Agent:
                 # Reset fields for new cycle
                 state["process_history"] = []
                 state["route"] = None
-                state["response"] = None
 
                 # Update only the part of the state that changes
                 state["user_message"] = user_input
