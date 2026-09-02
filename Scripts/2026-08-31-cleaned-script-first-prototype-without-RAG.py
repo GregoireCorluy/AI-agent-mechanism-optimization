@@ -57,7 +57,7 @@ from CombustionAgent.prompts import get_chat_prompt, get_fill_prompt, get_retrie
 # - LLM working better when it can "reason" and be wordy
 
 
-model_id = "Models/Llama-3.1-8B-Instruct"
+model_id = "models/Llama-3.1-8B-Instruct"
 
 schema = InputParameters.model_json_schema()
 
